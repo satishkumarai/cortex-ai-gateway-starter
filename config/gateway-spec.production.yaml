@@ -1,0 +1,41 @@
+# Cortex AI Gateway specification — PRODUCTION
+#
+# Applied with: ALTER AI GATEWAY SNOWFLAKE FROM SPECIFICATION $$ ... $$
+# WARNING: FROM SPECIFICATION replaces the entire spec. A field left out
+# reverts to its default. Always apply the full file and verify with
+# DESCRIBE AI GATEWAY SNOWFLAKE afterwards.
+#
+# schema_version must be 1 (only supported value per docs).
+
+schema_version: 1
+
+# Explicit allow-list. Do NOT use '*' in production — '*' exposes every
+# model the account can reach, including models added tomorrow, with no
+# review of cost or fit.
+models:
+  - name: claude-sonnet-4-6
+  - name: claude-haiku-4-5
+  - name: claude-opus-5
+
+logging:
+  # Master switch for all tracing. With false, nothing is recorded
+  # regardless of capture_payload. Keep true in production.
+  enabled: true
+
+  # Accept OTLP traces exported by client applications
+  # (endpoint: <gateway-endpoint>/telemetry/v1/traces).
+  enable_client_telemetry: true
+
+  capture_payload:
+    # Records full prompts and model responses in the trace event table
+    # IN YOUR ACCOUNT. This is a data-classification decision, not a
+    # debugging toggle. Classify, restrict, and set retention on the
+    # trace table before enabling.
+    request_response: true
+
+    # Users tagged with any of these get metadata-only logging even with
+    # request_response: true. Only tags set DIRECTLY ON USERS count.
+    # Tags must exist or ALTER fails. If the gateway can't determine
+    # exclusion, it fails closed (no payload captured).
+    exclude_tags:
+      - GOVERNANCE.TAGS.PAYLOAD_CAPTURE_EXEMPT

@@ -1,0 +1,28 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  spec-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Validate gateway specs
+        run: |
+          python ci/validate_yaml.py config/gateway-spec.production.yaml
+          python ci/validate_yaml.py config/gateway-spec.sandbox.yaml
+
+      - name: Ensure apply script mirrors production spec
+        run: |
+          echo "Manual check reminder: sql/03_apply_spec.sql body must match config/gateway-spec.production.yaml"

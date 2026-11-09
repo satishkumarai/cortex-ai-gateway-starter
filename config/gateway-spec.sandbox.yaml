@@ -1,0 +1,17 @@
+# Cortex AI Gateway specification — SANDBOX / PILOT
+#
+# Open model access, metadata-only logging. Suitable for evaluation only.
+# Do not reuse in production: '*' skips model review entirely.
+
+schema_version: 1
+
+models:
+  - name: '*'
+
+logging:
+  enabled: true
+  enable_client_telemetry: true
+  capture_payload:
+    # No prompt/response content in sandbox. Metadata (user, model,
+    # tokens, timing) is still recorded per request.
+    request_response: false
