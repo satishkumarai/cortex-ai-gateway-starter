@@ -29,7 +29,6 @@ A production-grade reference implementation for running **Snowflake Cortex AI Ga
 │   ├── architecture.md          # Before/after, trust boundaries, ADRs
 │   ├── implementation-plan.md   # Phased production rollout
 │   ├── runbooks/                # Spec drift, budget cutoff, incident response
-│   └── medium/                  # Publish-ready Medium article
 ├── .github/           # PR template + validation workflow
 └── Makefile           # lint / validate entry points
 ```
