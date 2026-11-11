@@ -1,7 +1,8 @@
 -- 06_alerts.sql
 -- Native, consolidated AI Gateway alerting: two alert+procedure pairs.
 --   AI_GW_WATCHER_SCHED (hourly)  -> AI_GW_WATCHER(): drift + failure-rate +
---                                    429 checks; emails ONLY on anomaly.
+--                                    429 + per-user prompt-stuffing checks;
+--                                    emails ONLY on anomaly.
 --   AI_GW_DAILY_DIGEST_SCHED      -> AI_GW_DAILY_DIGEST(): 24h digest + 7d
 --      (daily 13:00 UTC)           showback, HTML email.
 -- Native Snowflake ALERT + SYSTEM$SEND_EMAIL; no automation fire, no
@@ -17,6 +18,32 @@ CREATE TABLE IF NOT EXISTS GOVERNANCE.AUDIT.AI_GW_ALERT_LOG (
   ALERT_NAME STRING,
   DETAIL     VARIANT
 );
+
+-- Automated PAT disable on prompt-stuffing detection (AI_GW_WATCHER).
+-- Tokens are DISABLED (ALTER USER ... MODIFY PAT ... SET DISABLED = TRUE),
+-- not removed, so a false positive is undone with SET DISABLED = FALSE.
+-- Users listed in AI_GW_REVOKE_EXEMPT still alert but are never disabled
+-- (break-glass admins, the procedure owner's own user, critical services).
+-- Kill switch: set auto_revoke := FALSE in AI_GW_WATCHER.
+CREATE TABLE IF NOT EXISTS GOVERNANCE.AUDIT.AI_GW_REVOKE_EXEMPT (
+  USER_NAME STRING NOT NULL,
+  REASON    STRING,
+  ADDED_BY  STRING DEFAULT CURRENT_USER(),
+  ADDED_TS  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+-- INSERT INTO GOVERNANCE.AUDIT.AI_GW_REVOKE_EXEMPT (USER_NAME, REASON)
+--   VALUES ('<BREAK_GLASS_ADMIN>', 'break-glass');
+
+CREATE TABLE IF NOT EXISTS GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG (
+  EVENT_TS   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  USER_NAME  STRING,
+  TOKEN_NAME STRING,
+  ACTION     STRING,   -- DISABLED | FAILED | EXEMPT | NO_ACTIVE_TOKENS
+  REASON     STRING,
+  ERROR      STRING
+);
+-- Re-enable after review:
+--   ALTER USER "<user>" MODIFY PAT "<token>" SET DISABLED = FALSE;
 
 -- Expected production spec (mirrors config/gateway-spec.production.yaml).
 -- The watcher compares the live DESCRIBE output to this. Keep in sync with
@@ -35,6 +62,20 @@ DECLARE
   fail_models STRING DEFAULT '';
   fail_chips  STRING DEFAULT '';
   throttled   NUMBER DEFAULT 0;
+  stuff_users NUMBER DEFAULT 0;
+  stuff_names STRING DEFAULT '';
+  stuff_chips STRING DEFAULT '';
+  stuff_arr   ARRAY DEFAULT ARRAY_CONSTRUCT();
+  auto_revoke BOOLEAN DEFAULT TRUE;   -- kill switch for automated PAT disable
+  revoked     NUMBER DEFAULT 0;
+  revoke_fail NUMBER DEFAULT 0;
+  revoked_list STRING DEFAULT '';
+  u_name      STRING;
+  u_quoted    STRING;
+  is_exempt   NUMBER;
+  tok_arr     ARRAY;
+  tok_name    STRING;
+  err_msg     STRING;
   live_spec   STRING;
   expected    STRING;
   drift       BOOLEAN DEFAULT FALSE;
@@ -93,12 +134,93 @@ logging:
   WHERE timestamp >= DATEADD(hour,-1,SYSDATE())
     AND TRY_TO_NUMBER(record_attributes:"http.status_code"::string) = 429;
 
-  anomalies := (IFF(:drift,1,0) + IFF(:fail_reqs>0,1,0) + IFF(:throttled>=50,1,0));
+  -- Prompt stuffing: an identity's prompts suddenly get much larger than its
+  -- own history (e.g. a CI token pasting query results into prompts). Spend
+  -- quotas miss this when request rate is unchanged. Identity is
+  -- resource_attributes:"snow.user.name" (verified live; a PAT maps to its
+  -- user, so this is per user, not per individual PAT). Fires when, for one
+  -- user: >=20 baseline reqs (prior 14d, excl. last hour), >=5 reqs this hour,
+  -- current median input tokens >= 2000 AND > 3x that user's baseline p95.
+  -- Requests without input_tokens (e.g. 4xx) are ignored.
+  SELECT COUNT(*),
+         COALESCE(LISTAGG(usr, ', '), 'none'),
+         COALESCE(LISTAGG('<span style="display:inline-block;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:11px;font-weight:600;padding:3px 10px;border-radius:999px;margin:2px 4px 2px 0;">'
+                          || usr || ' · median ' || cur_med_in::int || ' vs p95 ' || base_p95_in::int || ' in-tok</span>', ' '), ''),
+         ARRAY_AGG(usr)
+  INTO :stuff_users, :stuff_names, :stuff_chips, :stuff_arr
+  FROM (
+    WITH r AS (
+      SELECT resource_attributes:"snow.user.name"::string AS usr, timestamp AS ts,
+             TRY_TO_NUMBER(record_attributes:"gen_ai.usage.input_tokens"::string) AS in_tok
+      FROM TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))
+      WHERE timestamp >= DATEADD(day,-14,SYSDATE())
+        AND record_attributes:"gen_ai.operation.name"::string = 'chat'
+        AND TRY_TO_NUMBER(record_attributes:"gen_ai.usage.input_tokens"::string) IS NOT NULL
+    ), base AS (
+      SELECT usr, COUNT(*) AS base_reqs, APPROX_PERCENTILE(in_tok,0.95) AS base_p95_in
+      FROM r WHERE ts < DATEADD(hour,-1,SYSDATE()) GROUP BY usr
+    ), cur AS (
+      SELECT usr, COUNT(*) AS cur_reqs, MEDIAN(in_tok) AS cur_med_in
+      FROM r WHERE ts >= DATEADD(hour,-1,SYSDATE()) GROUP BY usr
+    )
+    SELECT c.usr, c.cur_med_in, b.base_p95_in
+    FROM cur c JOIN base b ON b.usr = c.usr
+    WHERE b.base_reqs >= 20 AND c.cur_reqs >= 5
+      AND c.cur_med_in >= 2000 AND c.cur_med_in > 3 * b.base_p95_in
+  );
+
+  -- Automated containment: disable every ACTIVE PAT of each flagged user,
+  -- unless the user is exempt. Each action is logged; one failure does not
+  -- stop the others. Identifiers are double-quoted to prevent injection.
+  IF (:auto_revoke AND :stuff_users > 0) THEN
+    FOR i IN 0 TO ARRAY_SIZE(:stuff_arr) - 1 DO
+      u_name   := GET(:stuff_arr, :i)::string;
+      u_quoted := '"' || REPLACE(:u_name, '"', '""') || '"';
+      SELECT COUNT(*) INTO :is_exempt
+        FROM GOVERNANCE.AUDIT.AI_GW_REVOKE_EXEMPT WHERE UPPER(USER_NAME) = UPPER(:u_name);
+      IF (:is_exempt > 0) THEN
+        INSERT INTO GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG (USER_NAME, ACTION, REASON)
+          VALUES (:u_name, 'EXEMPT', 'prompt_stuffing');
+      ELSE
+        EXECUTE IMMEDIATE 'SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER ' || :u_quoted;
+        SELECT COALESCE(ARRAY_AGG("name"), ARRAY_CONSTRUCT()) INTO :tok_arr
+          FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "status" = 'ACTIVE';
+        IF (ARRAY_SIZE(:tok_arr) = 0) THEN
+          INSERT INTO GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG (USER_NAME, ACTION, REASON)
+            VALUES (:u_name, 'NO_ACTIVE_TOKENS', 'prompt_stuffing');
+        ELSE
+        FOR j IN 0 TO ARRAY_SIZE(:tok_arr) - 1 DO
+          tok_name := GET(:tok_arr, :j)::string;
+          BEGIN
+            EXECUTE IMMEDIATE 'ALTER USER ' || :u_quoted || ' MODIFY PROGRAMMATIC ACCESS TOKEN "'
+                              || REPLACE(:tok_name, '"', '""') || '" SET DISABLED = TRUE';
+            INSERT INTO GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG (USER_NAME, TOKEN_NAME, ACTION, REASON)
+              VALUES (:u_name, :tok_name, 'DISABLED', 'prompt_stuffing');
+            revoked := :revoked + 1;
+            revoked_list := :revoked_list || IFF(:revoked_list = '', '', ', ') || :u_name || '/' || :tok_name;
+          EXCEPTION
+            WHEN OTHER THEN
+              err_msg := SQLERRM;
+              INSERT INTO GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG (USER_NAME, TOKEN_NAME, ACTION, REASON, ERROR)
+                VALUES (:u_name, :tok_name, 'FAILED', 'prompt_stuffing', :err_msg);
+              revoke_fail := :revoke_fail + 1;
+          END;
+        END FOR;
+        END IF;
+      END IF;
+    END FOR;
+  END IF;
+
+  anomalies := (IFF(:drift,1,0) + IFF(:fail_reqs>0,1,0) + IFF(:throttled>=50,1,0) + IFF(:stuff_users>0,1,0));
 
   detail := '{"window":"1h","spec_drift":' || :drift::string
             || ',"failing_models":' || :fail_reqs || ',"failing_model_reqs":' || :fail_total
             || ',"failing_model_names":"' || :fail_models || '"'
-            || ',"throttled_429":' || :throttled || ',"anomalies":' || :anomalies || '}';
+            || ',"throttled_429":' || :throttled
+            || ',"prompt_stuffing_users":' || :stuff_users || ',"prompt_stuffing_names":"' || :stuff_names || '"'
+            || ',"auto_revoke":' || :auto_revoke::string || ',"pats_disabled":' || :revoked
+            || ',"pat_disable_failures":' || :revoke_fail
+            || ',"anomalies":' || :anomalies || '}';
   INSERT INTO GOVERNANCE.AUDIT.AI_GW_ALERT_LOG (ALERT_NAME, DETAIL)
   SELECT 'AI_GW_WATCHER', PARSE_JSON(:detail);
 
@@ -109,12 +231,15 @@ logging:
   -- plain-English summary + severity
   summary := IFF(:drift,'Gateway spec drifted from the approved configuration. ','')
           || IFF(:fail_reqs>0, :fail_reqs || ' model(s) failing above threshold (' || :fail_models || '). ','')
-          || IFF(:throttled>=50, 'Heavy rate limiting in the last hour (' || :throttled || ' HTTP 429s).','');
+          || IFF(:throttled>=50, 'Heavy rate limiting in the last hour (' || :throttled || ' HTTP 429s). ','')
+          || IFF(:stuff_users>0, 'Prompt size spiked >3x baseline for ' || :stuff_users || ' identit' || IFF(:stuff_users=1,'y','ies') || ' (' || :stuff_names || ').','')
+          || IFF(:revoked>0, ' Auto-disabled ' || :revoked || ' PAT(s): ' || :revoked_list || '.','')
+          || IFF(:revoke_fail>0, ' ' || :revoke_fail || ' PAT disable(s) FAILED — see AI_GW_PAT_REVOCATION_LOG.','');
   sev     := IFF(:anomalies>=2,'HIGH','MEDIUM');
   sev_col := IFF(:anomalies>=2,'#b91c1c','#d97706');
 
   subject := '[AI Gateway][' || :sev || '] Watcher — ' || :anomalies || ' anomal' || IFF(:anomalies=1,'y','ies')
-             || ': ' || IFF(:drift,'drift ','') || IFF(:fail_reqs>0,'failures ','') || IFF(:throttled>=50,'429s','');
+             || ': ' || IFF(:drift,'drift ','') || IFF(:fail_reqs>0,'failures ','') || IFF(:throttled>=50,'429s ','') || IFF(:stuff_users>0,'prompt-stuffing','');
   body :=
     '<html><body style="margin:0;padding:32px 16px;background:#f1f5f9;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">'
     || '<div style="max-width:680px;margin:0 auto;">'
@@ -143,6 +268,10 @@ logging:
        '<div style="margin-top:20px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Failing models</div>'
        ||'<div style="margin-top:8px;">'||:fail_chips||'</div>',
        '')
+    || IFF(:stuff_users>0,
+       '<div style="margin-top:20px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Prompt size vs own baseline (1h)</div>'
+       ||'<div style="margin-top:8px;">'||:stuff_chips||'</div>',
+       '')
     || '<div style="margin-top:20px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Raw detail</div>'
     || '<div style="margin-top:8px;padding:12px 16px;background:#0f172a;border-radius:8px;font-family:monospace;font-size:11px;color:#e2e8f0;">'||:detail||'</div>'
     || '<div style="margin-top:20px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Recommended next steps</div>'
@@ -150,10 +279,11 @@ logging:
     || '<tr><td style="padding:4px 10px 4px 0;color:#3b82f6;font-weight:700;">1.</td><td>Open <b>Snowsight → AI Gateway → Observability</b> and filter to the failing model / error spans.</td></tr>'
     || '<tr><td style="padding:4px 10px 4px 0;color:#3b82f6;font-weight:700;">2.</td><td>If drift: re-apply the approved spec via <b>sql/03_apply_spec.sql</b>, then re-run the watcher.</td></tr>'
     || '<tr><td style="padding:4px 10px 4px 0;color:#3b82f6;font-weight:700;">3.</td><td>If throttling: review <b>AI Gateway → Cost</b> and per-user quotas for the noisy identity.</td></tr>'
+    || '<tr><td style="padding:4px 10px 4px 0;color:#3b82f6;font-weight:700;">4.</td><td>If prompt stuffing: flagged users'' active PATs are auto-disabled (see <b>GOVERNANCE.AUDIT.AI_GW_PAT_REVOCATION_LOG</b>). Inspect recent turns (<b>sql/04_observability/inspect_turn.sql</b>); if benign, re-enable with <b>ALTER USER ... MODIFY PAT ... SET DISABLED = FALSE</b> and consider adding the user to AI_GW_REVOKE_EXEMPT.</td></tr>'
     || '</table>'
     || '</div>'
     || '<div style="background:#f8fafc;color:#94a3b8;font-size:11px;padding:14px 28px;border-radius:0 0 14px 14px;border-top:1px solid #e2e8f0;">'
-    || 'Sent by AI_GW_WATCHER — anomaly-only alerts (spec drift, failure spike, throttling). Full history in GOVERNANCE.AUDIT.AI_GW_ALERT_LOG.</div>'
+    || 'Sent by AI_GW_WATCHER — anomaly-only alerts (spec drift, failure spike, throttling, prompt stuffing). Full history in GOVERNANCE.AUDIT.AI_GW_ALERT_LOG.</div>'
     || '</div></body></html>';
 
   CALL SYSTEM$SEND_EMAIL('AI_GW_SHOWBACK_EMAIL','<verified-user-email>', :subject, :body, 'text/html') INTO :sent;
